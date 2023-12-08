@@ -1,0 +1,39 @@
+- base.getenv:
+    TMP: TMP
+    PERM: PERM
+    BASE: "/home/a/antonio/repos/graphcast-ox/data_prep"
+
+- base.context:
+    output_folder: "{{TMP}}"
+    year: 2018
+    request_file: "{{BASE}}/fetch_era5_surface.py"
+    surface: true
+    
+- base.echo:
+    msg: "Output folder: {{output_folder}}"
+
+# Use the conda environment that has the CDS API installed
+- base.command:
+    name: conda
+    args: [activate, base]
+
+- hpc.slurm.sbatch:
+    time: !noparse 05:00:00
+    partition: shared
+    job-name: test
+
+- base.context:
+    job:
+      slurm:
+        srun:
+          args:
+            [
+              "python",
+              "{{request_file}}",
+              "--year", 
+              "{{year}}",
+              "--output-dir", 
+              "{{output_folder}}",
+              "{{'--surface' if surface else ''}}"
+            ]
+
