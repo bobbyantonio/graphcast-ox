@@ -33,6 +33,9 @@ sys.path.append('/home/a/antonio/repos/graphcast-ox/graphcast')
 from graphcast import graphcast as gc
 
 DATASET_FOLDER = '/home/a/antonio/repos/graphcast-ox/dataset'
+OUTPUT_VARS = [
+    '2m_temperature', 'total_precipitation_6hr', '10m_v_component_of_wind', '10m_u_component_of_wind', 'specific_humidity'
+]
 
 params_file = SimpleNamespace(value='/home/a/antonio/repos/graphcast-ox/params/params_GraphCast-ERA5_1979-2017-resolution_0.25-pressure_levels_37-mesh_2to6-precipitation_input_and_output.npz')
 
@@ -123,6 +126,17 @@ def drop_state(fn):
 run_forward_jitted = drop_state(with_params(jax.jit(with_configs(
         run_forward.apply))))
 
+def format_dataset(ds):
+    
+    rename_dict = {'latitude': 'lat', 'longitude': 'lon' }
+
+    ds = xr.merge(ds.values())
+    ds = ds.rename(rename_dict)
+    
+    ds = ds.sortby('lat', ascending=True)
+    ds = ds.sortby('lon', ascending=True)
+    
+    return ds
 
 if __name__ == '__main__':
     
@@ -166,19 +180,19 @@ if __name__ == '__main__':
     static_ds = xr.merge(static_das.values())
     static_ds = static_ds.rename(rename_dict)
     static_ds = static_ds.drop_vars('time')
+    
+    static_ds = format_dataset(static_ds)
 
     assert sorted(static_ds.data_vars) == sorted(gc.STATIC_VARS )
-
-
+    # Check lat values are correctly ordered
+    assert static_ds.lat[0] < 0 
+    assert static_ds.lat[-1] > 0
 
     logger.debug(f'Input file: {prepared_data_fp}')
     if not os.path.isfile(prepared_data_fp):
         
         logger.debug('Input file not found, creating data')
-        
-        
-
-
+   
         ######
         # Surface
 
@@ -211,6 +225,7 @@ if __name__ == '__main__':
         dt_arr = np.expand_dims(pd.date_range(start=f'{year}{month:02d}01', periods=3, freq='6h'),0)
         surface_ds = surface_ds.assign_coords(datetime=(('batch', 'time'),  dt_arr))
 
+        surface_ds = format_dataset(surface_ds)
 
         #############
 
@@ -232,17 +247,14 @@ if __name__ == '__main__':
         plevel_ds['time'] = [item - plevel_ds['time'].values[1] for item in plevel_ds['time'].values]
 
         assert sorted(plevel_ds.data_vars) == sorted(gc.TARGET_ATMOSPHERIC_VARS)
+        
+        plevel_ds = format_dataset(plevel_ds)
 
         # Add datetime coordinate
         dt_arr = np.expand_dims(pd.date_range(start=f'{year}{month:02d}01', periods=3, freq='6h'),0)
         plevel_ds = plevel_ds.assign_coords(datetime=(('batch', 'time'),  dt_arr))
 
         prepared_ds = xr.merge([static_ds, surface_ds, plevel_ds])
-        prepared_ds = prepared_ds.rename({'latitude': 'lat', 'longitude': 'lon'})
-
-        # ERA5 has latitude the wrong way round!
-        prepared_ds = prepared_ds.sortby('lat', ascending=True)
-        prepared_ds = prepared_ds.sortby('lon', ascending=True)
 
         prepared_ds.to_netcdf(prepared_data_fp)
 
@@ -292,7 +304,8 @@ if __name__ == '__main__':
                 targets_template=targets * np.nan,
                 forcings=forcings)
         
-        prediction_ds.to_netcdf(os.path.join(args.output_dir, f'pred_{year}{month:02d}01_n{n}.nc'))
+        # Save a selection of the data
+        prediction_ds[OUTPUT_VARS].isel(level=len(gc.PRESSURE_LEVELS_ERA5_37)-1).to_netcdf(os.path.join(args.output_dir, f'pred_{year}{month:02d}01_n{n}.nc'))
         
         # Get new inputs from predictions
         #TODO: there is something that is forcing this to recompile every time
