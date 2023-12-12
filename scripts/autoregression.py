@@ -1,3 +1,10 @@
+'''
+Script for rolling out graphcast predictions
+
+On Oxford's A100, it currently runs out of memory when trying to load in enough data for between 80-100 time steps (80 works, 100 doesn't)
+
+'''
+
 import dataclasses
 import functools
 from types import SimpleNamespace
@@ -12,8 +19,10 @@ from graphcast import normalization
 from graphcast import rollout
 from graphcast import xarray_jax
 from graphcast import xarray_tree
+from graphcast import data
 
 import os, sys
+import datetime
 import haiku as hk
 import jax
 import numpy as np
@@ -46,6 +55,50 @@ params = ckpt.params
 
 model_config = ckpt.model_config
 task_config = ckpt.task_config
+
+
+def get_all_visible_methods(obj):
+    return [item for item in dir(obj) if not item.startswith('_')]
+
+def format_dataarray(da):
+    
+    rename_dict = {'latitude': 'lat', 'longitude': 'lon' }
+
+    da = da.rename(rename_dict)
+    
+    da = da.sortby('lat', ascending=True)
+    da = da.sortby('lon', ascending=True)
+    
+    return da
+
+def load_clean_dataarray(fp, add_batch_dim=False):
+    
+    da = xr.load_dataarray(fp)
+    da = format_dataarray(da)
+    
+    if add_batch_dim:
+        da = da.expand_dims({'batch': 1})
+
+    return da
+
+def add_datetime(ds, start: str,
+                 periods: int,
+                 freq: str='6h',
+                 ):
+    
+    dt_arr = np.expand_dims(pd.date_range(start=start, periods=periods, freq=freq),0)
+    ds = ds.assign_coords(datetime=(('batch', 'time'),  dt_arr))
+    return ds
+
+def convert_to_relative_time(ds, zero_time: np.datetime64):
+    
+    ds['time'] = ds['time'] - zero_time
+    return ds
+
+def ns_to_hr(ns_val: float):
+    
+    return ns_val* 1e-9 / (60*60)
+
 
 ################################
 ## Functions from graphcast notebook
@@ -126,17 +179,7 @@ def drop_state(fn):
 run_forward_jitted = drop_state(with_params(jax.jit(with_configs(
         run_forward.apply))))
 
-def format_dataset(ds):
-    
-    rename_dict = {'latitude': 'lat', 'longitude': 'lon' }
 
-    ds = xr.merge(ds.values())
-    ds = ds.rename(rename_dict)
-    
-    ds = ds.sortby('lat', ascending=True)
-    ds = ds.sortby('lon', ascending=True)
-    
-    return ds
 
 if __name__ == '__main__':
     
@@ -158,114 +201,59 @@ if __name__ == '__main__':
     logger.info(f'Platform: {xla_bridge.get_backend().platform}')
     
     prepared_data_fp = os.path.join(DATASET_FOLDER, 'prepared_inputs', f'input_{year}{month:02d}01.nc')
+    
+
     ########
     # Static variables
-    static_das = {}
-    rename_dict = {}
+    static_ds = data.load_era5_static(year=year, month=month)
 
-    for var in tqdm(gc.STATIC_VARS):
+    ######
+    # Surface
+    surface_ds = data.load_era5_surface(year=year, month=month)
 
-        if var == 'geopotential_at_surface':
-            var = 'geopotential'
-            
-        folder_name = 'surface'
-        tmp_da = xr.load_dataarray(os.path.join(DATASET_FOLDER, folder_name, f'era5_{var}_{year}{1:02d}.nc'))
-        tmp_da = tmp_da.isel(time=0)
-        
-        static_das[var] = tmp_da
-        rename_dict[tmp_da.name] = var
+    #############
+    # Pressure levels 
+    plevel_ds = data.load_era5_plevel(year=year, month=month)
+
+    prepared_ds = xr.merge([surface_ds, plevel_ds])
     
-    rename_dict['z'] = 'geopotential_at_surface'
-
-    static_ds = xr.merge(static_das.values())
-    static_ds = static_ds.rename(rename_dict)
-    static_ds = static_ds.drop_vars('time')
     
-    static_ds = format_dataset(static_ds)
+    #TODO: I think this can be donw much more straightforwardly with reindex ?
+    
+    # Add forcing data for as long as needed, to be used in the rollout
+    # In order to do this we need dummy target data (replace with nulls at inference time)
+    # so this just uses the same values as the last available time step
 
-    assert sorted(static_ds.data_vars) == sorted(gc.STATIC_VARS )
-    # Check lat values are correctly ordered
-    assert static_ds.lat[0] < 0 
-    assert static_ds.lat[-1] > 0
+    zero_time = prepared_ds['datetime'][0][1].values
 
-    logger.debug(f'Input file: {prepared_data_fp}')
-    if not os.path.isfile(prepared_data_fp):
+    # Note: Solar radiation is assumed to be in 6hr intervals
+    solar_radiation_ds = load_clean_dataarray(os.path.join(DATASET_FOLDER, f'surface/era5_toa_incident_solar_radiation_{year}{month:02d}.nc'), add_batch_dim=True)
+    solar_radiation_ds = add_datetime(solar_radiation_ds, start=solar_radiation_ds['time'].values[0], periods=len(solar_radiation_ds['time']), freq='6h')
+    solar_radiation_ds = convert_to_relative_time(solar_radiation_ds, zero_time=zero_time)
+
+    ds_slice = prepared_ds.isel(time=slice(-1, None))
+    ds_final_datetime = ds_slice['datetime'][0][0]
+    ds_final_time = ds_slice['time'][0]
+
+    dts_to_fill = np.array([dt.values for dt in solar_radiation_ds['datetime'][0] if dt > ds_final_datetime])
+    dts_to_fill = dts_to_fill - zero_time
+    future_forcings = solar_radiation_ds.sel(time=dts_to_fill)
+
+    future_targets = []
+    for i, dt in enumerate(dts_to_fill[:args.num_steps]):
+        target = ds_slice.copy()
+        target['time'] = target['time'] + np.timedelta64(6*(i+1), 'h')
+        target['datetime'] = target['datetime'] + np.timedelta64(6*(i+1), 'h')
+
+        external_forcing = future_forcings.isel(time=slice(i,i+1))
+        target['toa_incident_solar_radiation'] = external_forcing
         
-        logger.debug('Input file not found, creating data')
-   
-        ######
-        # Surface
+        future_targets.append(target)
 
-        surf_das = {}
-        rename_dict = {}
+    # Concat it all together
 
-        for var in tqdm(gc.TARGET_SURFACE_VARS + gc.EXTERNAL_FORCING_VARS):
-
-            if var == 'total_precipitation_6hr':
-                var = 'total_precipitation'
-                
-            folder_name = 'surface'
-            tmp_da = xr.load_dataarray(os.path.join(DATASET_FOLDER, folder_name, f'era5_{var}_{year}{1:02d}.nc'))
-            tmp_da = tmp_da.expand_dims({'batch': 1})
-
-            surf_das[var] = tmp_da
-            rename_dict[tmp_da.name] = var
-            
-            if var == 'total_precipitation':
-                surf_das[var] = tmp_da.resample(time='6h').sum()
-                rename_dict[tmp_da.name] = 'total_precipitation_6hr'
-                
-        surface_ds = xr.merge(surf_das.values())
-        surface_ds = surface_ds.rename(rename_dict)
-        surface_ds['time'] = [item - surface_ds['time'].values[1] for item in surface_ds['time'].values]
-
-        assert sorted(surface_ds.data_vars) == sorted(gc.EXTERNAL_FORCING_VARS + gc.TARGET_SURFACE_VARS )
-
-        # Add datetime coordinate
-        dt_arr = np.expand_dims(pd.date_range(start=f'{year}{month:02d}01', periods=3, freq='6h'),0)
-        surface_ds = surface_ds.assign_coords(datetime=(('batch', 'time'),  dt_arr))
-
-        surface_ds = format_dataset(surface_ds)
-
-        #############
-
-        plevel_das = {}
-        rename_dict = {}
-
-        for var in tqdm(gc.TARGET_ATMOSPHERIC_VARS):
-
-            folder_name = 'plevels'
-            tmp_da = xr.load_dataarray(os.path.join(DATASET_FOLDER, folder_name, f'era5_{var}_{year}{1:02d}.nc'))
-            tmp_da = tmp_da.expand_dims({'batch': 1})
-
-            plevel_das[var] = tmp_da
-            rename_dict[tmp_da.name] = var
-
-        plevel_ds = xr.merge(plevel_das.values())
-        plevel_ds = plevel_ds.rename(rename_dict)
-
-        plevel_ds['time'] = [item - plevel_ds['time'].values[1] for item in plevel_ds['time'].values]
-
-        assert sorted(plevel_ds.data_vars) == sorted(gc.TARGET_ATMOSPHERIC_VARS)
-        
-        plevel_ds = format_dataset(plevel_ds)
-
-        # Add datetime coordinate
-        dt_arr = np.expand_dims(pd.date_range(start=f'{year}{month:02d}01', periods=3, freq='6h'),0)
-        plevel_ds = plevel_ds.assign_coords(datetime=(('batch', 'time'),  dt_arr))
-
-        prepared_ds = xr.merge([static_ds, surface_ds, plevel_ds])
-
-        prepared_ds.to_netcdf(prepared_data_fp)
-
-    else:
-        
-        prepared_ds = xr.load_dataset(prepared_data_fp)
-        
-    # Use example input just 
-    example_batch_path = os.path.join(DATASET_FOLDER, 'source-era5_date-2022-01-01_res-0.25_levels-37_steps-01.nc')
-    with open(example_batch_path, 'rb') as f:
-        example_batch = xr.load_dataset(f).compute()
+    prepared_ds = xr.concat([prepared_ds] + future_targets, dim='time')
+    prepared_ds = xr.merge([static_ds,prepared_ds])
         
     with open("/home/a/antonio/repos/graphcast-ox/stats/diffs_stddev_by_level.nc","rb") as f:
         diffs_stddev_by_level = xr.load_dataset(f).compute()
@@ -274,65 +262,85 @@ if __name__ == '__main__':
     with open("/home/a/antonio/repos/graphcast-ox/stats/stddev_by_level.nc","rb") as f:
         stddev_by_level = xr.load_dataset(f).compute()
         
-    solar_radiation_ds = xr.load_dataset(os.path.join(DATASET_FOLDER, 'surface/era5_toa_incident_solar_radiation_201601.nc'))
-        
-    autoregressive_steps = 1
     task_config_dict = dataclasses.asdict(task_config)
+    max_lead_time = ns_to_hr(prepared_ds['time'].max())
     
+    logger.info(f'Max lead time = {int(max_lead_time)}')
+
     ## Warm up step
     inputs, targets, forcings = data_utils.extract_inputs_targets_forcings(
-                prepared_ds, target_lead_times=slice("6h", "6h"),
+                prepared_ds, target_lead_times=slice("6h", f"{int(max_lead_time)}h"),
                 **task_config_dict)
     
-    # Keep track of target datetimes, for adding to autoregressive inputs
-    datetime_vals = prepared_ds['datetime'].values
-        
-    rollout.chunked_prediction(
-            run_forward_jitted,
-            rng=jax.random.PRNGKey(0),
-            inputs=inputs,
-            targets_template=targets * np.nan,
-            forcings=forcings)
-        
-    logger.info('Generating predictions')
-    for n in tqdm(range(args.num_steps)):
-        
-        prediction_ds = rollout.chunked_prediction(
-                run_forward_jitted,
-                rng=jax.random.PRNGKey(0),
-                inputs=inputs,
-                targets_template=targets * np.nan,
-                forcings=forcings)
-        
-        # Save a selection of the data
-        prediction_ds[OUTPUT_VARS].isel(level=len(gc.PRESSURE_LEVELS_ERA5_37)-1).to_netcdf(os.path.join(args.output_dir, f'pred_{year}{month:02d}01_n{n}.nc'))
-        
-        # Get new inputs from predictions
-        #TODO: there is something that is forcing this to recompile every time
-        # Maybe down to different structure of dataset?
-        # Need one function that loads datasets consistently
-        
-        datetime_vals = datetime_vals + np.timedelta64(6, 'h')
-        
-        prediction_ds['time'] = np.array([np.timedelta64(0, 'ns')])
+    prediction_ds = rollout.chunked_prediction(
+        run_forward_jitted,
+        rng=jax.random.PRNGKey(0),
+        inputs=inputs,
+        targets_template=targets * np.nan,
+        forcings=forcings)
+    
+    logger.info('Writing predictions to file')
+    prediction_ds[OUTPUT_VARS].isel(level=len(gc.PRESSURE_LEVELS_ERA5_37)-1).to_netcdf(os.path.join(args.output_dir, f'pred_{year}{month:02d}01_ntot{args.num_steps}.nc'))
 
-        new_dummy_targets = targets
-
-        minus_6hr_input = inputs.isel(time=1)
-        minus_6hr_input['time'] = np.array([np.timedelta64(-21600000000000, 'ns')])
-        minus_6hr_input = minus_6hr_input.drop_vars(gc.FORCING_VARS + gc.STATIC_VARS)
-        new_ds = xr.concat([minus_6hr_input, prediction_ds, new_dummy_targets],dim='time')
-
-        tmp_solar_radiation_ds = solar_radiation_ds.sel(time=datetime_vals[0])
-        tmp_solar_radiation_ds['time'] = [item - tmp_solar_radiation_ds['time'].values[1] for item in tmp_solar_radiation_ds['time'].values]
-        tmp_solar_radiation_ds = tmp_solar_radiation_ds.rename({'latitude': 'lat', 'longitude': 'lon', 'tisr': 'toa_incident_solar_radiation'})
-        tmp_solar_radiation_ds = tmp_solar_radiation_ds.expand_dims({'batch': 1})
-        tmp_solar_radiation_ds = tmp_solar_radiation_ds.sortby('lat', ascending=True)
-        tmp_solar_radiation_ds = tmp_solar_radiation_ds.sortby('lon', ascending=True)
+    # solar_radiation_ds = xr.load_dataset(os.path.join(DATASET_FOLDER, 'surface/era5_toa_incident_solar_radiation_201601.nc'))
         
-        new_ds = xr.merge([new_ds, static_ds, tmp_solar_radiation_ds])
-        new_ds = new_ds.assign_coords(datetime=(('batch', 'time'),  datetime_vals))
+    # autoregressive_steps = 1
+    # task_config_dict = dataclasses.asdict(task_config)
+    
+    # ## Warm up step
+    # inputs, targets, forcings = data_utils.extract_inputs_targets_forcings(
+    #             prepared_ds, target_lead_times=slice("6h", "6h"),
+    #             **task_config_dict)
+    
+    # # Keep track of target datetimes, for adding to autoregressive inputs
+    # datetime_vals = prepared_ds['datetime'].values
+        
+    # rollout.chunked_prediction(
+    #         run_forward_jitted,
+    #         rng=jax.random.PRNGKey(0),
+    #         inputs=inputs,
+    #         targets_template=targets * np.nan,
+    #         forcings=forcings)
+        
+    # logger.info('Generating predictions')
+    # for n in tqdm(range(args.num_steps)):
+        
+    #     prediction_ds = rollout.chunked_prediction(
+    #             run_forward_jitted,
+    #             rng=jax.random.PRNGKey(0),
+    #             inputs=inputs,
+    #             targets_template=targets * np.nan,
+    #             forcings=forcings)
+        
+    #     # Save a selection of the data
+    #     prediction_ds[OUTPUT_VARS].isel(level=len(gc.PRESSURE_LEVELS_ERA5_37)-1).to_netcdf(os.path.join(args.output_dir, f'pred_{year}{month:02d}01_n{n}.nc'))
+        
+    #     # Get new inputs from predictions
+    #     #TODO: there is something that is forcing this to recompile every time
+    #     # Maybe down to different structure of dataset?
+    #     # Need one function that loads datasets consistently
+        
+    #     datetime_vals = datetime_vals + np.timedelta64(6, 'h')
+        
+    #     prediction_ds['time'] = np.array([np.timedelta64(0, 'ns')])
 
-        inputs, targets, forcings = data_utils.extract_inputs_targets_forcings(
-                new_ds, target_lead_times=slice("6h", "6h"),
-                **task_config_dict)
+    #     new_dummy_targets = targets
+
+    #     minus_6hr_input = inputs.isel(time=1)
+    #     minus_6hr_input['time'] = np.array([np.timedelta64(-21600000000000, 'ns')])
+    #     minus_6hr_input = minus_6hr_input.drop_vars(gc.FORCING_VARS + gc.STATIC_VARS)
+    #     new_ds = xr.concat([minus_6hr_input, prediction_ds, new_dummy_targets],dim='time')
+
+    #     tmp_solar_radiation_ds = solar_radiation_ds.sel(time=datetime_vals[0])
+    #     tmp_solar_radiation_ds['time'] = [item - tmp_solar_radiation_ds['time'].values[1] for item in tmp_solar_radiation_ds['time'].values]
+    #     tmp_solar_radiation_ds = tmp_solar_radiation_ds.rename({'latitude': 'lat', 'longitude': 'lon', 'tisr': 'toa_incident_solar_radiation'})
+    #     tmp_solar_radiation_ds = tmp_solar_radiation_ds.expand_dims({'batch': 1})
+    #     tmp_solar_radiation_ds = tmp_solar_radiation_ds.sortby('lat', ascending=True)
+    #     tmp_solar_radiation_ds = tmp_solar_radiation_ds.sortby('lon', ascending=True)
+        
+    #     new_ds = xr.merge([new_ds, static_ds, tmp_solar_radiation_ds])
+    #     new_ds = new_ds.assign_coords(datetime=(('batch', 'time'),  datetime_vals))
+
+    #     inputs, targets, forcings = data_utils.extract_inputs_targets_forcings(
+    #             new_ds, target_lead_times=slice("6h", "6h"),
+    #             **task_config_dict)
