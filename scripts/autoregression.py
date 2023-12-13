@@ -312,8 +312,8 @@ if __name__ == '__main__':
 
         current_inputs = rollout._get_next_inputs(current_inputs, next_frame)
         prediction = prediction.assign_coords(time=actual_target_time)
-        predictions.append(prediction)
         
         prediction[OUTPUT_VARS].isel(level=len(gc.PRESSURE_LEVELS_ERA5_37)-1).to_netcdf(os.path.join(args.output_dir, f'pred_{year}{month:02d}01_n{chunk_index}.nc'))
-
+        del prediction
+        
     logger.info('Complete')
