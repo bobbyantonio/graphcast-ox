@@ -14,12 +14,11 @@ from graphcast import autoregressive
 from graphcast import casting
 from graphcast import checkpoint
 from graphcast import data_utils
-from graphcast import graphcast
+from graphcast import graphcast as gc
 from graphcast import normalization
 from graphcast import rollout
 from graphcast import xarray_jax
 from graphcast import xarray_tree
-from graphcast import data
 
 import os, sys
 import datetime
@@ -38,8 +37,9 @@ logger.setLevel(logging.INFO)
 
 sys.path.append('/home/a/antonio/repos/graphcast-ox/data_prep')
 sys.path.append('/home/a/antonio/repos/graphcast-ox/graphcast')
+sys.path.append('/home/a/antonio/repos/graphcast-ox/graphcast/data')
 
-from graphcast import graphcast as gc
+import data
 
 DATASET_FOLDER = '/home/a/antonio/repos/graphcast-ox/dataset'
 OUTPUT_VARS = [
@@ -50,12 +50,18 @@ params_file = SimpleNamespace(value='/home/a/antonio/repos/graphcast-ox/params/p
 
     # @title Load the model
 with open(f"{params_file.value}", 'rb') as f:
-    ckpt = checkpoint.load(f, graphcast.CheckPoint)
+    ckpt = checkpoint.load(f, gc.CheckPoint)
 params = ckpt.params
 
 model_config = ckpt.model_config
 task_config = ckpt.task_config
 
+with open("/home/a/antonio/repos/graphcast-ox/stats/diffs_stddev_by_level.nc","rb") as f:
+    diffs_stddev_by_level = xr.load_dataset(f).compute()
+with open("/home/a/antonio/repos/graphcast-ox/stats/mean_by_level.nc", "rb") as f:
+    mean_by_level = xr.load_dataset(f).compute()
+with open("/home/a/antonio/repos/graphcast-ox/stats/stddev_by_level.nc","rb") as f:
+    stddev_by_level = xr.load_dataset(f).compute()
 
 def get_all_visible_methods(obj):
     return [item for item in dir(obj) if not item.startswith('_')]
@@ -103,12 +109,12 @@ def ns_to_hr(ns_val: float):
 ################################
 ## Functions from graphcast notebook
 def construct_wrapped_graphcast(
-    model_config: graphcast.ModelConfig,
-    task_config: graphcast.TaskConfig):
+    model_config: gc.ModelConfig,
+    task_config: gc.TaskConfig):
     """Constructs and wraps the GraphCast Predictor."""
     
     # Deeper one-step predictor.
-    predictor = graphcast.GraphCast(model_config, task_config)
+    predictor = gc.GraphCast(model_config, task_config)
 
     # Modify inputs/outputs to `graphcast.GraphCast` to handle conversion to
     # from/to float32 to/from BFloat16.
@@ -193,15 +199,14 @@ if __name__ == '__main__':
     parser.add_argument('--month', type=int, default=1,
                         help='Month to start on')
     parser.add_argument('--day', type=int, default=1,
-                    help='Day of month to start on')  
+                    help='Day of month to start on') 
+    parser.add_argument('--load-era5', action='store_true',
+                        help='Load from ERA5') 
     args = parser.parse_args()
     year = args.year
     month = args.month
     
     logger.info(f'Platform: {xla_bridge.get_backend().platform}')
-    
-    prepared_data_fp = os.path.join(DATASET_FOLDER, 'prepared_inputs', f'input_{year}{month:02d}01.nc')
-    
 
     ########
     # Static variables
@@ -214,133 +219,101 @@ if __name__ == '__main__':
     #############
     # Pressure levels 
     plevel_ds = data.load_era5_plevel(year=year, month=month)
+    prepared_ds = xr.merge([static_ds, surface_ds, plevel_ds])
+    prepared_ds = convert_to_relative_time(prepared_ds, prepared_ds['time'][1])
 
-    prepared_ds = xr.merge([surface_ds, plevel_ds])
-    
-    
-    #TODO: I think this can be donw much more straightforwardly with reindex ?
-    
-    # Add forcing data for as long as needed, to be used in the rollout
-    # In order to do this we need dummy target data (replace with nulls at inference time)
-    # so this just uses the same values as the last available time step
-
-    zero_time = prepared_ds['datetime'][0][1].values
+    t0 = prepared_ds['datetime'][0][1].values
 
     # Note: Solar radiation is assumed to be in 6hr intervals
     solar_radiation_ds = load_clean_dataarray(os.path.join(DATASET_FOLDER, f'surface/era5_toa_incident_solar_radiation_{year}{month:02d}.nc'), add_batch_dim=True)
     solar_radiation_ds = add_datetime(solar_radiation_ds, start=solar_radiation_ds['time'].values[0], periods=len(solar_radiation_ds['time']), freq='6h')
-    solar_radiation_ds = convert_to_relative_time(solar_radiation_ds, zero_time=zero_time)
+    solar_radiation_ds = convert_to_relative_time(solar_radiation_ds, zero_time=t0)
 
     ds_slice = prepared_ds.isel(time=slice(-1, None))
     ds_final_datetime = ds_slice['datetime'][0][0]
     ds_final_time = ds_slice['time'][0]
 
     dts_to_fill = np.array([dt.values for dt in solar_radiation_ds['datetime'][0] if dt > ds_final_datetime])
-    dts_to_fill = dts_to_fill - zero_time
-    future_forcings = solar_radiation_ds.sel(time=dts_to_fill)
+    ts_to_fill = dts_to_fill - t0
+    future_forcings = solar_radiation_ds.sel(time=ts_to_fill).to_dataset()
+    future_forcings = future_forcings.rename({'tisr': 'toa_incident_solar_radiation'})
 
-    future_targets = []
-    for i, dt in enumerate(dts_to_fill[:args.num_steps]):
-        target = ds_slice.copy()
-        target['time'] = target['time'] + np.timedelta64(6*(i+1), 'h')
-        target['datetime'] = target['datetime'] + np.timedelta64(6*(i+1), 'h')
-
-        external_forcing = future_forcings.isel(time=slice(i,i+1))
-        target['toa_incident_solar_radiation'] = external_forcing
-        
-        future_targets.append(target)
-
-    # Concat it all together
-
-    prepared_ds = xr.concat([prepared_ds] + future_targets, dim='time')
-    prepared_ds = xr.merge([static_ds,prepared_ds])
-        
-    with open("/home/a/antonio/repos/graphcast-ox/stats/diffs_stddev_by_level.nc","rb") as f:
-        diffs_stddev_by_level = xr.load_dataset(f).compute()
-    with open("/home/a/antonio/repos/graphcast-ox/stats/mean_by_level.nc", "rb") as f:
-        mean_by_level = xr.load_dataset(f).compute()
-    with open("/home/a/antonio/repos/graphcast-ox/stats/stddev_by_level.nc","rb") as f:
-        stddev_by_level = xr.load_dataset(f).compute()
-        
     task_config_dict = dataclasses.asdict(task_config)
-    max_lead_time = ns_to_hr(prepared_ds['time'].max())
-    
-    logger.info(f'Max lead time = {int(max_lead_time)}')
 
-    ## Warm up step
     inputs, targets, forcings = data_utils.extract_inputs_targets_forcings(
-                prepared_ds, target_lead_times=slice("6h", f"{int(max_lead_time)}h"),
+                prepared_ds, target_lead_times=slice("6h", "6h"),
                 **task_config_dict)
     
-    prediction_ds = rollout.chunked_prediction(
-        run_forward_jitted,
-        rng=jax.random.PRNGKey(0),
-        inputs=inputs,
-        targets_template=targets * np.nan,
-        forcings=forcings)
-    
-    logger.info('Writing predictions to file')
-    prediction_ds[OUTPUT_VARS].isel(level=len(gc.PRESSURE_LEVELS_ERA5_37)-1).to_netcdf(os.path.join(args.output_dir, f'pred_{year}{month:02d}01_ntot{args.num_steps}.nc'))
+    predictor_fn = run_forward_jitted
+    rng=jax.random.PRNGKey(0)
+    targets_template=targets * np.nan
+    verbose=True
+    num_steps_per_chunk = 1
+    ############################
 
-    # solar_radiation_ds = xr.load_dataset(os.path.join(DATASET_FOLDER, 'surface/era5_toa_incident_solar_radiation_201601.nc'))
-        
-    # autoregressive_steps = 1
-    # task_config_dict = dataclasses.asdict(task_config)
-    
-    # ## Warm up step
-    # inputs, targets, forcings = data_utils.extract_inputs_targets_forcings(
-    #             prepared_ds, target_lead_times=slice("6h", "6h"),
-    #             **task_config_dict)
-    
-    # # Keep track of target datetimes, for adding to autoregressive inputs
-    # datetime_vals = prepared_ds['datetime'].values
-        
-    # rollout.chunked_prediction(
-    #         run_forward_jitted,
-    #         rng=jax.random.PRNGKey(0),
-    #         inputs=inputs,
-    #         targets_template=targets * np.nan,
-    #         forcings=forcings)
-        
-    # logger.info('Generating predictions')
-    # for n in tqdm(range(args.num_steps)):
-        
-    #     prediction_ds = rollout.chunked_prediction(
-    #             run_forward_jitted,
-    #             rng=jax.random.PRNGKey(0),
-    #             inputs=inputs,
-    #             targets_template=targets * np.nan,
-    #             forcings=forcings)
-        
-    #     # Save a selection of the data
-    #     prediction_ds[OUTPUT_VARS].isel(level=len(gc.PRESSURE_LEVELS_ERA5_37)-1).to_netcdf(os.path.join(args.output_dir, f'pred_{year}{month:02d}01_n{n}.nc'))
-        
-    #     # Get new inputs from predictions
-    #     #TODO: there is something that is forcing this to recompile every time
-    #     # Maybe down to different structure of dataset?
-    #     # Need one function that loads datasets consistently
-        
-    #     datetime_vals = datetime_vals + np.timedelta64(6, 'h')
-        
-    #     prediction_ds['time'] = np.array([np.timedelta64(0, 'ns')])
+    inputs = xr.Dataset(inputs)
+    targets_template = xr.Dataset(targets_template)
+    forcings = xr.Dataset(forcings)
 
-    #     new_dummy_targets = targets
+    if "datetime" in inputs.coords:
+        del inputs.coords["datetime"]
 
-    #     minus_6hr_input = inputs.isel(time=1)
-    #     minus_6hr_input['time'] = np.array([np.timedelta64(-21600000000000, 'ns')])
-    #     minus_6hr_input = minus_6hr_input.drop_vars(gc.FORCING_VARS + gc.STATIC_VARS)
-    #     new_ds = xr.concat([minus_6hr_input, prediction_ds, new_dummy_targets],dim='time')
+    if "datetime" in targets_template.coords:
+        output_datetime = targets_template.coords["datetime"]
+        del targets_template.coords["datetime"]
+    else:
+        output_datetime = None
 
-    #     tmp_solar_radiation_ds = solar_radiation_ds.sel(time=datetime_vals[0])
-    #     tmp_solar_radiation_ds['time'] = [item - tmp_solar_radiation_ds['time'].values[1] for item in tmp_solar_radiation_ds['time'].values]
-    #     tmp_solar_radiation_ds = tmp_solar_radiation_ds.rename({'latitude': 'lat', 'longitude': 'lon', 'tisr': 'toa_incident_solar_radiation'})
-    #     tmp_solar_radiation_ds = tmp_solar_radiation_ds.expand_dims({'batch': 1})
-    #     tmp_solar_radiation_ds = tmp_solar_radiation_ds.sortby('lat', ascending=True)
-    #     tmp_solar_radiation_ds = tmp_solar_radiation_ds.sortby('lon', ascending=True)
+    if "datetime" in forcings.coords:
+        del forcings.coords["datetime"]
+
+    num_target_steps = targets_template.dims["time"]
+    num_chunks, remainder = divmod(num_target_steps, num_steps_per_chunk)
+    if remainder != 0:
+        raise ValueError(
+            f"The number of steps per chunk {num_steps_per_chunk} must "
+            f"evenly divide the number of target steps {num_target_steps} ")
+
+    if len(np.unique(np.diff(targets_template.coords["time"].data))) > 1:
+        raise ValueError("The targets time coordinates must be evenly spaced")
+
+    # Our template targets will always have a time axis corresponding for the
+    # timedeltas for the first chunk.
+    targets_chunk_time = targets_template.time.isel(
+        time=slice(0, num_steps_per_chunk))
+
+    current_inputs = inputs
+    # Target template is fixed
+    current_targets_template = targets_template.isel(time=slice(0,1))
+
+    predictions = []
+    for chunk_index in tqdm(range(args.num_steps)):
         
-    #     new_ds = xr.merge([new_ds, static_ds, tmp_solar_radiation_ds])
-    #     new_ds = new_ds.assign_coords(datetime=(('batch', 'time'),  datetime_vals))
+        if chunk_index == 0:
+            current_forcings = forcings
+        else:
+            current_forcings = future_forcings.isel(time=slice(chunk_index-1, chunk_index))
+            data_utils.add_derived_vars(current_forcings)
+            current_forcings = current_forcings[list(task_config_dict['forcing_variables'])].drop_vars("datetime")
 
-    #     inputs, targets, forcings = data_utils.extract_inputs_targets_forcings(
-    #             new_ds, target_lead_times=slice("6h", "6h"),
-    #             **task_config_dict)
+        actual_target_time = current_forcings.coords["time"]  
+        current_forcings = current_forcings.assign_coords(time=targets_chunk_time)
+        current_forcings = current_forcings.compute()
+        
+        # Make predictions for the chunk.
+        rng, this_rng = jax.random.split(rng)
+        prediction = predictor_fn(
+            rng=this_rng,
+            inputs=current_inputs,
+            targets_template=current_targets_template,
+            forcings=current_forcings)
+
+        next_frame = xr.merge([prediction, current_forcings])
+
+        current_inputs = rollout._get_next_inputs(current_inputs, next_frame)
+        prediction = prediction.assign_coords(time=actual_target_time)
+        predictions.append(prediction)
+        
+        prediction[OUTPUT_VARS].isel(level=len(gc.PRESSURE_LEVELS_ERA5_37)-1).to_netcdf(os.path.join(args.output_dir, f'pred_{year}{month:02d}01_n{chunk_index}.nc'))
+
+    logger.info('Complete')

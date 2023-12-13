@@ -53,6 +53,13 @@ def ns_to_hr(ns_val: float):
     
     return ns_val* 1e-9 / (60*60)
 
+def load_era5(var: str, type: str, year: int, month: int, day: int, hour: int,
+              rename_to_str: str=None):
+    
+    da = load_clean_dataarray(os.path.join(DATASET_FOLDER, type, f'era5_{var}_{year}{month:02d}.nc'), 
+                                  add_batch_dim=False)
+    
+    return da
 
 def load_era5_static(year, month):
     
@@ -111,7 +118,6 @@ def load_era5_surface(year, month):
             
     surface_ds = xr.merge(surf_das.values())
     surface_ds = surface_ds.rename(rename_dict)
-    surface_ds['time'] = [item - surface_ds['time'].values[1] for item in surface_ds['time'].values]
 
     assert sorted(surface_ds.data_vars) == sorted(gc.EXTERNAL_FORCING_VARS + gc.TARGET_SURFACE_VARS )
 
@@ -136,8 +142,6 @@ def load_era5_plevel(year, month):
 
     plevel_ds = xr.merge(plevel_das.values())
     plevel_ds = plevel_ds.rename(rename_dict)
-
-    plevel_ds['time'] = [item - plevel_ds['time'].values[1] for item in plevel_ds['time'].values]
 
     assert sorted(plevel_ds.data_vars) == sorted(gc.TARGET_ATMOSPHERIC_VARS)
     
