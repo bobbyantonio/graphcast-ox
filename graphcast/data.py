@@ -1,4 +1,5 @@
 import os, sys
+import datetime
 import xarray as xr
 from tqdm import tqdm
 from pathlib import Path
@@ -11,7 +12,6 @@ DATASET_FOLDER = str(HOME / 'dataset')
 sys.path.append(str(HOME / 'graphcast'))
 
 from graphcast import graphcast as gc
-
 
 
 def format_dataarray(da):
@@ -53,11 +53,24 @@ def ns_to_hr(ns_val: float):
     
     return ns_val* 1e-9 / (60*60)
 
-def load_era5(var: str, type: str, year: int, month: int, day: int, hour: int,
-              rename_to_str: str=None):
+def load_era5(var: str,
+                year: int,
+                month: int,
+                day: int,
+                hour: int,
+                pressure_level=None):
     
-    da = load_clean_dataarray(os.path.join(DATASET_FOLDER, type, f'era5_{var}_{year}{month:02d}.nc'), 
-                                  add_batch_dim=False)
+    if pressure_level is None:
+        data_type = 'surface'
+    else:
+        data_type = 'plevels'
+        
+    da = load_clean_dataarray(os.path.join(DATASET_FOLDER, data_type, f'era5_{var}_{year}{month:02d}.nc'), 
+                              add_batch_dim=False)
+    da.sel(time=datetime.datetime(year, month, day, hour))
+    
+    if pressure_level is not None:
+        da = da.sel(level=pressure_level)
     
     return da
 
@@ -104,17 +117,24 @@ def load_era5_surface(year, month):
         tmp_da = load_clean_dataarray(os.path.join(DATASET_FOLDER, folder_name, f'era5_{var}_{year}{1:02d}.nc'),
                                         add_batch_dim=True,
                                         )
-        
-        if var == 'toa_incident_solar_radiation':
-            tmp_da = tmp_da.sel(time=pd.date_range(start=f'{year}{month:02d}01', periods=3, freq='6h'))
+        if var != 'total_precipitation':
+            time_sel = pd.date_range(start=datetime.datetime(year,month, 1, 6), periods=3, freq='6h')
+        else:
+            time_sel = pd.date_range(start=datetime.datetime(year,month, 1, 1), periods=18, freq='1h')
+        tmp_da = tmp_da.sel(time=time_sel)
 
         surf_das[var] = tmp_da
         rename_dict[tmp_da.name] = var
         
         if var == 'total_precipitation':
-            surf_das[var] = tmp_da.resample(time='6h').sum()
+            # Have to do some funny stuff with offsets to ensure the right hours are being aggregated,
+            # and labelled in the right way
+            surf_das[var] = tmp_da.resample(time='6h', 
+                                            label='right', 
+                                            offset=datetime.timedelta(hours=1), # Offset of grouping
+                                            loffset =datetime.timedelta(hours=-1) # Label offset
+                                            ).sum()
             rename_dict[tmp_da.name] = 'total_precipitation_6hr'
-        
             
     surface_ds = xr.merge(surf_das.values())
     surface_ds = surface_ds.rename(rename_dict)
@@ -122,7 +142,9 @@ def load_era5_surface(year, month):
     assert sorted(surface_ds.data_vars) == sorted(gc.EXTERNAL_FORCING_VARS + gc.TARGET_SURFACE_VARS )
 
     # Add datetime coordinate
-    surface_ds = add_datetime(surface_ds, start=f'{year}{month:02d}01', periods=3, freq='6h')
+    surface_ds = add_datetime(surface_ds,
+                              start=datetime.datetime(year,month, 1, 6),
+                              periods=3, freq='6h')
     
     return surface_ds
 
@@ -130,6 +152,8 @@ def load_era5_plevel(year, month):
     
     plevel_das = {}
     rename_dict = {}
+    
+    time_sel = pd.date_range(start=datetime.datetime(year, month, 1, 6), periods=3, freq='6h')
 
     for var in tqdm(gc.TARGET_ATMOSPHERIC_VARS):
 
@@ -137,6 +161,7 @@ def load_era5_plevel(year, month):
         tmp_da = load_clean_dataarray(os.path.join(DATASET_FOLDER, folder_name, f'era5_{var}_{year}{month:02d}.nc'),
                                         add_batch_dim=True)
 
+        tmp_da = tmp_da.sel(time=time_sel)
         plevel_das[var] = tmp_da
         rename_dict[tmp_da.name] = var
 
@@ -146,6 +171,8 @@ def load_era5_plevel(year, month):
     assert sorted(plevel_ds.data_vars) == sorted(gc.TARGET_ATMOSPHERIC_VARS)
     
     # Add datetime coordinate
-    plevel_ds = add_datetime(plevel_ds, start=f'{year}{month:02d}01', periods=3, freq='6h')
+    plevel_ds = add_datetime(plevel_ds,
+                            start=datetime.datetime(year,month, 1, 6),
+                            periods=3, freq='6h')
     
     return plevel_ds

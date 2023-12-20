@@ -85,6 +85,8 @@ if __name__ == '__main__':
                         help='Collect surface variables')
     parser.add_argument('--plevels', action='store_true',
                         help='Collect pressure level data')
+    parser.add_argument('--pressure-level', default=None,
+                    help='Specific pressure level to collect for')
     parser.add_argument('--vars', nargs='+', default=None,
                     help='Specific variable to collect data for')  
     parser.add_argument('--months', nargs='+', default=range(1,13),
@@ -97,11 +99,26 @@ if __name__ == '__main__':
         for var in args.vars:
             for month in args.months:
                 padded_month =f'{int(month):02d}'
-                retrieve_data(year=args.year,
-                            months=[padded_month],
-                            days=args.days,
-                            var=var,
-                            output_fp=os.path.join(args.output_dir, 'surface', f'era5_{var}_{args.year}{padded_month}.nc'))
+                
+                if var in SURFACE_VARS:
+                    retrieve_data(year=args.year,
+                                months=[padded_month],
+                                days=args.days,
+                                var=var,
+                                output_fp=os.path.join(args.output_dir, 'surface', f'era5_{var}_{args.year}{padded_month}.nc'))
+                elif var in PRESSURE_LEVEL_VARS and var != 'geopotential':
+                    if args.pressure_level is not None:
+                        output_fp = os.path.join(args.output_dir, 'plevels', f'era5_{var}_{args.year}{padded_month}_{args.pressure_level}hPa.nc')
+                        pressure_level=args.pressure_level
+                    else:
+                        output_fp = os.path.join(args.output_dir, 'plevels', f'era5_{var}_{args.year}{padded_month}.nc')
+                        pressure_level = PRESSURE_LEVELS_ERA5_37
+                    retrieve_data(year=args.year,
+                                months=[padded_month],
+                                days=args.days,
+                                var=var,
+                                pressure_level=pressure_level,
+                                output_fp=output_fp)
     
     if args.surface:
         for var in SURFACE_VARS:
@@ -113,15 +130,19 @@ if __name__ == '__main__':
                             var=var,
                             output_fp=os.path.join(args.output_dir, 'surface', f'era5_{var}_{args.year}{padded_month}.nc'))
             
-    if args.plevels:
+    if args.plevels and args.vars is None: 
         for var in PRESSURE_LEVEL_VARS:
             for month in args.months:
                 padded_month =f'{int(month):02d}'
+                if args.pressure_level is not None:
+                    output_fp = os.path.join(args.output_dir, 'plevels', f'era5_{var}_{args.year}{padded_month}_{args.pressure_level}hPa.nc')
+                else:
+                    output_fp = os.path.join(args.output_dir, 'plevels', f'era5_{var}_{args.year}{padded_month}.nc')
                 retrieve_data(year=args.year,
                                     months=[padded_month],
                                     var=var,
                                     days=args.days,
                                     pressure_level=PRESSURE_LEVELS_ERA5_37,
-                                    output_fp=os.path.join(args.output_dir, 'plevels', f'era5_{var}_{args.year}{padded_month}.nc'))
+                                    output_fp=output_fp)
     
     
