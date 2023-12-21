@@ -310,8 +310,9 @@ if __name__ == '__main__':
         # Make sure nonnegative vars are non negative
         for nn_var in NONEGATIVE_VARS:
             
-            original_data = current_inputs[nn_var].values
-            original_data[original_data<0] = 0
+            tmp_data = current_inputs[nn_var].values.copy()
+            tmp_data[tmp_data<0] = 0
+            current_inputs[nn_var].values = tmp_data
         
         # Make predictions for the chunk.
         rng, this_rng = jax.random.split(rng)
