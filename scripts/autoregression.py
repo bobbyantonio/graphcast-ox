@@ -45,6 +45,13 @@ DATASET_FOLDER = '/home/a/antonio/repos/graphcast-ox/dataset'
 OUTPUT_VARS = [
     '2m_temperature', 'total_precipitation_6hr', '10m_v_component_of_wind', '10m_u_component_of_wind', 'specific_humidity'
 ]
+NONEGATIVE_VARS = [
+    "2m_temperature",
+    "mean_sea_level_pressure",
+    "total_precipitation_6hr",
+    "temperature",
+    "specific_humidity",
+]
 
 params_file = SimpleNamespace(value='/home/a/antonio/repos/graphcast-ox/params/params_GraphCast-ERA5_1979-2017-resolution_0.25-pressure_levels_37-mesh_2to6-precipitation_input_and_output.npz')
 
@@ -299,6 +306,12 @@ if __name__ == '__main__':
         actual_target_time = current_forcings.coords["time"]  
         current_forcings = current_forcings.assign_coords(time=targets_chunk_time)
         current_forcings = current_forcings.compute()
+        
+        # Make sure nonnegative vars are non negative
+        for nn_var in NONEGATIVE_VARS:
+            
+            original_data = current_inputs[nn_var].values
+            original_data[original_data<0] = 0
         
         # Make predictions for the chunk.
         rng, this_rng = jax.random.split(rng)
