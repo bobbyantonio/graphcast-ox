@@ -209,6 +209,9 @@ if __name__ == '__main__':
                     help='Day of month to start on') 
     parser.add_argument('--load-era5', action='store_true',
                         help='Load from ERA5') 
+    parser.add_argument('--var-to-replace', type=str, default=None,
+                        help="Variable to replace with ERA5 input during autoregression"
+                        )
     args = parser.parse_args()
     year = args.year
     month = args.month
@@ -244,6 +247,42 @@ if __name__ == '__main__':
     ts_to_fill = dts_to_fill - t0
     future_forcings = solar_radiation_ds.sel(time=ts_to_fill).to_dataset()
     future_forcings = future_forcings.rename({'tisr': 'toa_incident_solar_radiation'})
+    ############################
+    
+    if args.var_to_replace is not None:
+        # Replace one of the vars with the ERA5 version
+        var_to_replace = 'total_precipitation_6hr'
+        num_autoregressive_steps = 120
+        target_datetimes = [datetime.datetime(year, month, 1, 12) + 
+                            datetime.timedelta(hours=6*(n+1)) for n in range(args.num_steps)]
+
+        if var_to_replace != 'total_precipitation_6hr':
+            era5_var_name = var_to_replace
+        else:
+            era5_var_name = 'total_precipitation'
+            
+        if var_to_replace == 'specific_humidity':
+            data_type = 'plevels'
+            plevel_suffix = '_1000hPa'
+        else:
+            data_type = 'surface'
+            plevel_suffix = ''
+
+        era5_target_da = xr.load_dataarray(os.path.join(DATASET_FOLDER, f'{data_type}/era5_{era5_var_name}_201601{plevel_suffix}.nc'))
+        era5_target_da = data.format_dataarray(era5_target_da)
+
+
+        if var_to_replace == 'total_precipitation_6hr':
+            precip_datetimes = [datetime.datetime(year, month, 1, 6) + datetime.timedelta(hours=n) for n in range(6*(args.num_steps+1))]
+            era5_target_da = era5_target_da.sel(time=precip_datetimes)
+            era5_target_da = era5_target_da.resample(time='6h', label='right').sum()
+        era5_target_da = era5_target_da.sel(time=target_datetimes)
+            
+        era5_target_da.name = var_to_replace
+        era5_target_da = convert_to_relative_time(era5_target_da, zero_time=t0)
+
+    
+    ############################
 
     task_config_dict = dataclasses.asdict(task_config)
 
@@ -288,6 +327,7 @@ if __name__ == '__main__':
     # timedeltas for the first chunk.
     targets_chunk_time = targets_template.time.isel(
         time=slice(0, num_steps_per_chunk))
+    input_times = inputs.time.values
 
     current_inputs = inputs
     # Target template is fixed
@@ -307,6 +347,24 @@ if __name__ == '__main__':
         current_forcings = current_forcings.assign_coords(time=targets_chunk_time)
         current_forcings = current_forcings.compute()
         
+        if args.var_to_replace is not None:
+            ## Replace vars if appropriate
+            if num_steps_per_chunk > 1:
+                raise ValueError('This code assumes chunks are always of size 1')
+            actual_input_times = current_inputs['time'].values + np.timedelta64(6*chunk_index,'h')
+            
+            new_vals = []
+            for t_ix, t in enumerate(actual_input_times):
+                if t>0:
+                    print(f'replacing {t}, {input_times[t_ix]}, {t_ix}')
+                    new_val = era5_target_da.sel(time=t)
+                    new_val['time'] = input_times[t_ix]
+                    new_vals.append(new_val)
+                else:
+                    new_vals.append(current_inputs[var_to_replace].sel(time=input_times[t_ix]))
+            new_da = xr.concat(new_vals, dim='time')
+            current_inputs = xr.merge([new_da, current_inputs[[v for v in current_inputs.data_vars if v != var_to_replace]]])
+
         # Make sure nonnegative vars are non negative
         for nn_var in NONEGATIVE_VARS:
             
@@ -327,7 +385,18 @@ if __name__ == '__main__':
         current_inputs = rollout._get_next_inputs(current_inputs, next_frame)
         prediction = prediction.assign_coords(time=actual_target_time)
         
-        prediction[OUTPUT_VARS].isel(level=len(gc.PRESSURE_LEVELS_ERA5_37)-1).to_netcdf(os.path.join(args.output_dir, f'pred_{year}{month:02d}01_n{chunk_index}.nc'))
+        if args.var_to_replace is not None:
+            save_dir = os.path.join(args.output_dir, f'replace_{args.var_to_replace}')
+        
+        else:
+            save_dir = args.output_dir
+        os.makedirs(save_dir, exist_ok=True)
+        
+        fp = os.path.join(save_dir, 
+                          f'replace_{args.var_to_replace}', 
+                          f'pred_{year}{month:02d}01_n{chunk_index}.nc')
+
+        prediction[OUTPUT_VARS].isel(level=len(gc.PRESSURE_LEVELS_ERA5_37)-1).to_netcdf()
         del prediction
         
     logger.info('Complete')
