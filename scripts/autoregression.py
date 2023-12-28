@@ -210,7 +210,8 @@ if __name__ == '__main__':
     parser.add_argument('--load-era5', action='store_true',
                         help='Load from ERA5') 
     parser.add_argument('--var-to-replace', type=str, default=None,
-                        help="Variable to replace with ERA5 input during autoregression"
+                        help="Variable to replace with ERA5 input during autoregression",
+                        choices=gc.TARGET_SURFACE_VARS # For now limit to the surface vars
                         )
     args = parser.parse_args()
     year = args.year
@@ -271,16 +272,16 @@ if __name__ == '__main__':
         era5_target_da = xr.load_dataarray(os.path.join(DATASET_FOLDER, f'{data_type}/era5_{era5_var_name}_201601{plevel_suffix}.nc'))
         era5_target_da = data.format_dataarray(era5_target_da)
 
-
         if var_to_replace == 'total_precipitation_6hr':
             precip_datetimes = [datetime.datetime(year, month, 1, 6) + datetime.timedelta(hours=n) for n in range(6*(args.num_steps+1))]
             era5_target_da = era5_target_da.sel(time=precip_datetimes)
             era5_target_da = era5_target_da.resample(time='6h', label='right').sum()
+            
         era5_target_da = era5_target_da.sel(time=target_datetimes)
             
         era5_target_da.name = var_to_replace
         era5_target_da = convert_to_relative_time(era5_target_da, zero_time=t0)
-
+        era5_target_da = era5_target_da.expand_dims({'batch': 1})
     
     ############################
 
@@ -297,8 +298,9 @@ if __name__ == '__main__':
     num_steps_per_chunk = 1
     ############################
 
-    inputs = xr.Dataset(inputs)
-    targets_template = xr.Dataset(targets_template)
+    sorted_input_coords_and_vars = sorted(inputs.coords) + sorted(inputs.data_vars)
+    inputs = xr.Dataset(inputs)[sorted_input_coords_and_vars]
+    targets_template = xr.Dataset(targets_template)[sorted(inputs.coords) + sorted(targets_template.data_vars)]
     forcings = xr.Dataset(forcings)
 
     if "datetime" in inputs.coords:
@@ -351,20 +353,31 @@ if __name__ == '__main__':
             ## Replace vars if appropriate
             if num_steps_per_chunk > 1:
                 raise ValueError('This code assumes chunks are always of size 1')
+            
             actual_input_times = current_inputs['time'].values + np.timedelta64(6*chunk_index,'h')
             
+            # Have to do it this way as other ways like assigning via
+            # current_inputs[var_to_replace].loc[dict(time=input_times[t_ix])].values = new_vals
+            # Doesn't seem to work
+            # But perhaps there is a better way that I have missed
             new_vals = []
             for t_ix, t in enumerate(actual_input_times):
-                if t>0:
-                    print(f'replacing {t}, {input_times[t_ix]}, {t_ix}')
+                if t > 0:
+
                     new_val = era5_target_da.sel(time=t)
                     new_val['time'] = input_times[t_ix]
                     new_vals.append(new_val)
+                    
                 else:
                     new_vals.append(current_inputs[var_to_replace].sel(time=input_times[t_ix]))
+            
             new_da = xr.concat(new_vals, dim='time')
-            current_inputs = xr.merge([new_da, current_inputs[[v for v in current_inputs.data_vars if v != var_to_replace]]])
-
+            new_inputs = xr.merge([new_da, current_inputs[[v for v in current_inputs.data_vars if v != var_to_replace]]])
+            
+            new_inputs = new_inputs[list(current_inputs.data_vars)]
+            new_inputs = new_inputs[sorted_input_coords_and_vars]
+            current_inputs = new_inputs
+            
         # Make sure nonnegative vars are non negative
         for nn_var in NONEGATIVE_VARS:
             
@@ -393,10 +406,9 @@ if __name__ == '__main__':
         os.makedirs(save_dir, exist_ok=True)
         
         fp = os.path.join(save_dir, 
-                          f'replace_{args.var_to_replace}', 
                           f'pred_{year}{month:02d}01_n{chunk_index}.nc')
 
-        prediction[OUTPUT_VARS].isel(level=len(gc.PRESSURE_LEVELS_ERA5_37)-1).to_netcdf()
+        prediction[OUTPUT_VARS].isel(level=len(gc.PRESSURE_LEVELS_ERA5_37)-1).to_netcdf(fp)
         del prediction
         
     logger.info('Complete')
