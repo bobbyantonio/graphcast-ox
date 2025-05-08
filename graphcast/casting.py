@@ -56,11 +56,11 @@ class Bfloat16Cast(predictor_base.Predictor):
           *_all_inputs_to_bfloat16(inputs, targets_template, forcings),
           **kwargs,)
 
-    predictions_dtype = infer_floating_dtype(predictions)
+    predictions_dtype = infer_floating_dtype(predictions)  # pytype: disable=wrong-arg-types
     if predictions_dtype != jnp.bfloat16:
       raise ValueError(f'Expected bfloat16 output, got {predictions_dtype}')
 
-    targets_dtype = infer_floating_dtype(targets_template)
+    targets_dtype = infer_floating_dtype(targets_template)  # pytype: disable=wrong-arg-types
     return tree_map_cast(
         predictions, input_dtype=jnp.bfloat16, output_dtype=targets_dtype)
 
@@ -80,7 +80,7 @@ class Bfloat16Cast(predictor_base.Predictor):
     if loss.dtype != jnp.bfloat16:
       raise ValueError(f'Expected bfloat16 loss, got {loss.dtype}')
 
-    targets_dtype = infer_floating_dtype(targets)
+    targets_dtype = infer_floating_dtype(targets)  # pytype: disable=wrong-arg-types
 
     # Note that casting back the loss to e.g. float32 should not affect data
     # types of the backwards pass, because the first thing the backwards pass
@@ -108,11 +108,11 @@ class Bfloat16Cast(predictor_base.Predictor):
     if loss.dtype != jnp.bfloat16:
       raise ValueError(f'Expected bfloat16 loss, got {loss.dtype}')
 
-    predictions_dtype = infer_floating_dtype(predictions)
+    predictions_dtype = infer_floating_dtype(predictions)  # pytype: disable=wrong-arg-types
     if predictions_dtype != jnp.bfloat16:
       raise ValueError(f'Expected bfloat16 output, got {predictions_dtype}')
 
-    targets_dtype = infer_floating_dtype(targets)
+    targets_dtype = infer_floating_dtype(targets)  # pytype: disable=wrong-arg-types
     return tree_map_cast(((loss, scalars), predictions),
                          input_dtype=jnp.bfloat16, output_dtype=targets_dtype)
 
@@ -140,7 +140,7 @@ def _all_inputs_to_bfloat16(
                xarray.Dataset,
                xarray.Dataset]:
   return (inputs.astype(jnp.bfloat16),
-          jax.tree_map(lambda x: x.astype(jnp.bfloat16), targets),
+          jax.tree.map(lambda x: x.astype(jnp.bfloat16), targets),
           forcings.astype(jnp.bfloat16))
 
 
@@ -149,7 +149,7 @@ def tree_map_cast(inputs: PyTree, input_dtype: np.dtype, output_dtype: np.dtype,
   def cast_fn(x):
     if x.dtype == input_dtype:
       return x.astype(output_dtype)
-  return jax.tree_map(cast_fn, inputs)
+  return jax.tree.map(cast_fn, inputs)
 
 
 @contextlib.contextmanager
